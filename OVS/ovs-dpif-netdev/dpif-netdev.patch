@@ -1,0 +1,194 @@
+*** dpif-netdev.c	2021-01-12 17:53:42.135528097 +0800
+--- dpif-netdev-modified.c	2021-01-12 17:53:28.144525530 +0800
+***************
+*** 80,85 ****
+--- 80,93 ----
+  #include "util.h"
+  #include "uuid.h"
+  
++ // Sigcomm: add ringbuffer header
++ #include "ringbuffer.h"
++ #include "tuple.h"
++ #include <rte_ip.h>
++ #include <rte_ether.h>
++ #include <rte_tcp.h>
++ //end
++ 
+  VLOG_DEFINE_THIS_MODULE(dpif_netdev);
+  
+  /* Auto Load Balancing Defaults */
+***************
+*** 751,756 ****
+--- 759,770 ----
+  
+      /* Set to true if the pmd thread needs to be reloaded. */
+      bool need_reload;
++ 
++     // Sigcomm: add ringbuffer
++ #ifdef SIGCOMM_MEASUREMENT
++     ringbuffer_t * rb;
++ #endif
++     // Sigcomm: end
+  };
+  
+  /* Interface to netdev-based datapath. */
+***************
+*** 858,863 ****
+--- 872,968 ----
+  static void queue_netdev_flow_del(struct dp_netdev_pmd_thread *pmd,
+                                    struct dp_netdev_flow *flow);
+  
++ // Sigcomm: add ringbuffer function
++ ringbuffer_t* create_ringbuffer_shm(const char* name, uint64_t tuple_size)
++ {
++     VLOG_INFO("SIGCOMM: This is a normal ringbuffer\n");
++ 
++     // allocate ringbuffer_t*
++     ringbuffer_t *ret = (ringbuffer_t*)malloc(sizeof(struct RingBuffer));
++     if(ret == NULL){
++         VLOG_ERR("SIGCOMM: ringbuffer_t* malloc() failed: %s\n", strerror(errno));
++     }
++ 
++     // setup name, fd, tuple size
++     ret->name = (char*)malloc(strlen(name) + 1);
++     if(ret == NULL){
++         VLOG_ERR("SIGCOMM: ringbuffer_t* name malloc() failed: %s\n", strerror(errno));
++     }
++     strcpy(ret->name, name);
++     ret->name[strlen(name)] = 0;
++     ret->fd = -1;
++     ret->tuple_size = tuple_size;
++ 
++     // create shared memory device
++     int shm_fd = -1;
++     shm_unlink(name);
++     shm_fd = shm_open(name, O_RDWR | O_CREAT | O_EXCL, S_IRUSR | S_IWUSR);
++     if(shm_fd == -1){
++         VLOG_ERR("SIGCOMM: shm_open() failed: %s\n", strerror(errno));
++     }
++ 
++     // set shared memory size
++     uint64_t shared_size = sizeof(sem_t) + sizeof(struct RBMeta) + sizeof(struct RBAppro) + RB_SIZE * tuple_size;
++     if(ftruncate(shm_fd, shared_size) == -1){
++         shm_unlink(name);
++         VLOG_ERR("SIGCOMM: ftruncate() failed: %s\n", strerror(errno));
++     }
++ 
++     // map into virtual memory address space
++     void *ptr = mmap(0, shared_size, PROT_READ | PROT_WRITE, MAP_SHARED, shm_fd, 0);
++     if(ptr == MAP_FAILED){
++         shm_unlink(name);
++         VLOG_ERR("SIGCOMM: mmap() failed: %s\n", strerror(errno));
++     }
++ 
++     // set up pointers to the shared memory region
++     ret->meta = (struct RBMeta*)((unsigned char*)ptr + sizeof(sem_t));
++     ret->appro = (struct RBAppro*)((unsigned char*)ptr + sizeof(sem_t) + sizeof(struct RBMeta));
++     ret->data = (unsigned char*)ptr + sizeof(sem_t) + sizeof(struct RBMeta) + sizeof(struct RBAppro);
++ 
++     // init ring buffer, require lock the resources
++     sem_t *sem = (sem_t*)ptr;
++     if(sem_init(sem, 1, 0) == -1){
++         shm_unlink(name);
++         LOG_ERR("SIGCOMM: sem_init() failed: %s\n", strerror(errno));
++     }
++ 
++     memset(ret->appro, 0, sizeof(struct RBAppro));
++     ret->meta->readIndex = 0; 
++     ret->meta->writeIndex = 0;
++     ret->meta->localWriteIndex = 0;
++     ret->meta->nextReadIndex = 0;
++     ret->meta->rBatchCount = 0;
++     ret->meta->localReadIndex = 0;
++     ret->meta->nextWriteIndex = 0;
++     ret->meta->wBatchCount = 0;
++     memset(ret->data, 0, RB_SIZE * tuple_size);
++ 
++     // complete init
++     sem_post(sem);
++     return ret;
++ }
++ 
++ // 0: sucesss; otherwise: fail
++ int write_ringbuffer(ringbuffer_t *rb, void *data, unsigned long size){
++     int afterNextWriteIndex = nextVal(rb->meta->nextWriteIndex);
++     if (afterNextWriteIndex == rb->meta->localReadIndex) {
++         if (afterNextWriteIndex == rb->meta->readIndex) {
++             return -1;
++         }
++         rb->meta->localReadIndex = rb->meta->readIndex;
++     }
++     memcpy(rb->data+rb->tuple_size*rb->meta->nextWriteIndex, data, size);
++     rb->meta->nextWriteIndex = afterNextWriteIndex;
++     rb->meta->wBatchCount++;
++     if (rb->meta->wBatchCount >= RB_BATCH) {
++         rb->meta->writeIndex = rb->meta->nextWriteIndex;
++         rb->meta->wBatchCount = 0;
++     }
++     return 0;
++ }
++ // Sigcomm: end
++ 
+  static void
+  emc_cache_init(struct emc_cache *flow_cache)
+  {
+***************
+*** 6040,6045 ****
+--- 6145,6165 ----
+      pmd_perf_stats_init(&pmd->perf_stats);
+      cmap_insert(&dp->poll_threads, CONST_CAST(struct cmap_node *, &pmd->node),
+                  hash_int(core_id, 0));
++ 
++     // Sigcomm: add ringbuffer setting
++ #ifdef SIGCOMM_MEASUREMENT 
++     char name[30];
++     static int local_index = 1;
++     if(core_id == NON_PMD_CORE_ID)
++ 	sprintf(name, "/rb_0");
++     else{
++         sprintf(name, "/rb_%d", local_index);
++         local_index++;
++     }
++     pmd->rb = create_ringbuffer_shm(name, sizeof(tuple_t));
++     VLOG_INFO("SIGCOMM: %s initialized.", name);
++ #endif
++     // Sigcomm: end
+  }
+  
+  static void
+***************
+*** 6511,6516 ****
+--- 6631,6663 ----
+          struct dp_netdev_flow *flow;
+          uint32_t mark;
+  
++ #ifdef SIGCOMM_MEASUREMENT
++         struct rte_mbuf *mbuf = &(packet->mbuf);
++         if(likely(mbuf != NULL)){
++             struct ether_hdr *eth_hdr;
++             eth_hdr = rte_pktmbuf_mtod(mbuf, struct ether_hdr *);
++             if(eth_hdr->ether_type == rte_cpu_to_be_16(ETHER_TYPE_IPv4)){
++                 struct ipv4_hdr *ip_hdr;
++                 ip_hdr = rte_pktmbuf_mtod_offset(mbuf, struct ipv4_hdr *, 14);
++                 if(ip_hdr->next_proto_id == 0x6){
++                     tuple_t tuple;
++                     struct tcp_hdr *tcp_hdr;
++ 
++                     tuple.key.src_ip = ip_hdr->src_addr;
++                     tuple.key.dst_ip = ip_hdr->dst_addr;
++                     tuple.key.proto = ip_hdr->next_proto_id;
++                     tuple.size = ip_hdr->total_length;
++ 
++                     tcp_hdr = rte_pktmbuf_mtod_offset(mbuf, struct tcp_hdr *, 14 + 20);
++                     tuple.key.src_port = tcp_hdr->src_port;
++                     tuple.key.dst_port = tcp_hdr->dst_port;
++                     while(write_ringbuffer(pmd->rb, (void*)&tuple, sizeof(tuple_t)) != 0);
++                 }
++             }
++         }
++ #endif
++         // Sigcomm: end
++ 
+          if (OVS_UNLIKELY(dp_packet_size(packet) < ETH_HEADER_LEN)) {
+              dp_packet_delete(packet);
+              continue;
