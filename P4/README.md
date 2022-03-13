@@ -4,8 +4,8 @@ The p4-16 implementation of *CocoSketch*
 
 ### File Description
 
-* `CocoSketch/cocoSketch.p4` includes the p4-16 implementation of *CocoSketch*
-* `CocoSketch/control.py` includes the control plane code for `CocoSketch`
+* `cocoSketch.p4` includes the p4-16 implementation of *CocoSketch*
+* `control.py` includes the control plane code for *CocoSketch*
 
 ### Usage
 
